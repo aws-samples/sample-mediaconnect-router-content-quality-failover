@@ -46,12 +46,12 @@ The CloudFormation template creates:
 ./deploy.sh <ARTIFACTS_BUCKET> <STACK_NAME> <SOURCE_CIDR> <NOTIFICATION_EMAIL> [FROZEN_FRAME_THRESHOLD] [AWS_PROFILE]
 ```
 
-- `ARTIFACTS_BUCKET` – S3 bucket used to stage the packaged Lambda zip. The script creates it if it does not exist.
-- `STACK_NAME` – CloudFormation stack name.
-- `SOURCE_CIDR` – Public IPv4 CIDR allowed to send video to the Router input, for example `203.0.113.0/24`. Restrict this to your encoder addresses.
-- `NOTIFICATION_EMAIL` – Email address that receives failover notifications.
-- `FROZEN_FRAME_THRESHOLD` – Optional duration in seconds before an alert fires. Valid values are 10–60; the default is 30.
-- `AWS_PROFILE` – Optional named AWS CLI profile.
+- `ARTIFACTS_BUCKET`: S3 bucket used to stage the packaged Lambda zip. The script creates it if it does not exist.
+- `STACK_NAME`: CloudFormation stack name.
+- `SOURCE_CIDR`: Public IPv4 CIDR allowed to send video to the Router input, for example `203.0.113.0/24`. Restrict this to your encoder addresses.
+- `NOTIFICATION_EMAIL`: Email address that receives failover notifications.
+- `FROZEN_FRAME_THRESHOLD`: Optional duration in seconds before an alert fires. Valid values are 10 to 60; the default is 30.
+- `AWS_PROFILE`: Optional named AWS CLI profile.
 
 Example:
 
@@ -59,7 +59,7 @@ Example:
 ./deploy.sh <your-artifacts-bucket> mediaconnect-router-cqa-demo 203.0.113.0/24 operator@example.com 30
 ```
 
-After deployment, Amazon SNS sends a confirmation message to `NOTIFICATION_EMAIL`. Open that message and confirm the subscription. Notifications are not delivered until the subscription is confirmed.
+After deployment, Amazon SNS sends a confirmation message to `NOTIFICATION_EMAIL`. Open that message and confirm the subscription. Email notifications are not delivered until the subscription is confirmed.
 
 The script prints the Router input ARN, ingest IP and ports, evidence bucket, SNS topic, Lambda function, and EventBridge rule.
 
