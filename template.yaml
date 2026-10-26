@@ -1,0 +1,409 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated monitoring and failover for an AWS Elemental MediaConnect Router input.
+  Detects frozen frames through content quality analysis, switches to a secondary
+  source, captures a thumbnail and source metadata in S3, and sends an SNS
+  notification. Lambda code is packaged from ./lambda using
+  'aws cloudformation package' (see deploy.sh). Note that this template creates
+  billable AWS resources, including an active MediaConnect Router input.
+
+Parameters:
+  FrozenFrameThreshold:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 60
+    Description: Threshold in seconds before frozen frames trigger an alert.
+
+  SourceCidr:
+    Type: String
+    Description: >
+      Public IPv4 CIDR block allowed to send video to the MediaConnect Router
+      input. Restrict this to your encoder/source IP range.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block, for example 203.0.113.0/24.
+
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives Router input failover notifications.
+    AllowedPattern: '^[^@ ]+@[^@ ]+\.[^@ ]+$'
+    ConstraintDescription: Must be a valid email address.
+
+Resources:
+  # S3 bucket that receives server access logs for the evidence bucket.
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'amzn-mediaconnect-demo-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Sub 'amzn-mediaconnect-demo-access-logs-${AWS::AccountId}-${AWS::Region}'
+        LogFilePrefix: access-log-bucket-logs/
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  - !GetAtt EvidenceBucket.Arn
+                  - !GetAtt AccessLogBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'amzn-mediaconnect-demo-evidence-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: evidence-access-logs/
+
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub '${EvidenceBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: MediaConnect Router failover notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref NotificationEmail
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+
+  PublicRouterNetworkInterface:
+    Type: AWS::MediaConnect::RouterNetworkInterface
+    Properties:
+      Name: !Sub '${AWS::StackName}-public-interface'
+      RegionName: !Ref AWS::Region
+      Configuration:
+        Public:
+          AllowRules:
+            - Cidr: !Ref SourceCidr
+
+  MonitoredRouterInput:
+    Type: AWS::MediaConnect::RouterInput
+    Properties:
+      Name: !Sub '${AWS::StackName}-input'
+      RegionName: !Ref AWS::Region
+      AvailabilityZone: !Select [0, !GetAZs '']
+      RoutingScope: GLOBAL
+      Tier: INPUT_50
+      MaximumBitrate: 50000000
+      Configuration:
+        Failover:
+          NetworkInterfaceArn: !Ref PublicRouterNetworkInterface
+          SourcePriorityMode: PRIMARY_SECONDARY
+          PrimarySourceIndex: 0
+          ProtocolConfigurations:
+            - Rtp:
+                Port: 20000
+                ForwardErrorCorrection: DISABLED
+            - Rtp:
+                Port: 20001
+                ForwardErrorCorrection: DISABLED
+      ContentQualityAnalysisConfiguration:
+        ContentLevel:
+          FrozenFrames:
+            State: ENABLED
+            ThresholdSeconds: !Ref FrozenFrameThreshold
+
+  # CloudFormation creates Router I/Os in standby. This function keeps the input
+  # lifecycle within the stack by starting it after creation and stopping it
+  # before deletion.
+  RouterInputLifecycleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RouterInputLifecyclePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconnect:GetRouterInput
+                  - mediaconnect:StartRouterInput
+                  - mediaconnect:StopRouterInput
+                Resource: !Ref MonitoredRouterInput
+
+  RouterInputLifecycleLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  RouterInputLifecycleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Starts and stops the MediaConnect Router input with the stack lifecycle
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt RouterInputLifecycleRole.Arn
+      Timeout: 180
+      LoggingConfig:
+        LogGroup: !Ref RouterInputLifecycleLogGroup
+      Code:
+        ZipFile: |
+          import logging
+          import time
+
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          mediaconnect = boto3.client("mediaconnect")
+
+          def get_state(arn):
+              response = mediaconnect.get_router_input(Arn=arn)
+              return response["RouterInput"]["State"]
+
+          def wait_for_state(arn, target):
+              for _ in range(30):
+                  state = get_state(arn)
+                  if state == target:
+                      return state
+                  logger.info("Router input %s is %s; waiting for %s", arn, state, target)
+                  time.sleep(5)
+              raise TimeoutError(f"Router input {arn} did not reach {target}")
+
+          def start_input(arn):
+              state = get_state(arn)
+              if state == "ACTIVE":
+                  return state
+              if state == "STOPPING":
+                  wait_for_state(arn, "STANDBY")
+              if get_state(arn) == "STANDBY":
+                  mediaconnect.start_router_input(Arn=arn)
+              return wait_for_state(arn, "ACTIVE")
+
+          def stop_input(arn):
+              try:
+                  state = get_state(arn)
+                  if state == "STANDBY":
+                      return state
+                  if state == "STARTING":
+                      wait_for_state(arn, "ACTIVE")
+                  if get_state(arn) == "ACTIVE":
+                      mediaconnect.stop_router_input(Arn=arn)
+                  return wait_for_state(arn, "STANDBY")
+              except mediaconnect.exceptions.NotFoundException:
+                  return "DELETED"
+
+          def handler(event, context):
+              arn = event["ResourceProperties"]["RouterInputArn"]
+              try:
+                  request_type = event["RequestType"]
+                  logger.info("Handling %s for %s", request_type, arn)
+                  state = stop_input(arn) if request_type == "Delete" else start_input(arn)
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {"State": state},
+                      physicalResourceId=arn,
+                  )
+              except Exception as error:
+                  logger.exception("Router input lifecycle operation failed")
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {"Error": str(error)},
+                      physicalResourceId=arn,
+                  )
+
+  RouterInputLifecycle:
+    Type: Custom::RouterInputLifecycle
+    DependsOn:
+      - RouterInputLifecycleLogGroup
+    Properties:
+      ServiceToken: !GetAtt RouterInputLifecycleFunction.Arn
+      RouterInputArn: !Ref MonitoredRouterInput
+      ServiceTimeout: 180
+
+  MonitorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConnectRouterMonitorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconnect:GetRouterInput
+                  - mediaconnect:GetRouterInputSourceMetadata
+                  - mediaconnect:GetRouterInputThumbnail
+                  - mediaconnect:UpdateRouterInput
+                Resource: !Ref MonitoredRouterInput
+              - Effect: Allow
+                Action: mediaconnect:AssociateRouterNetworkInterface
+                Resource: !Ref PublicRouterNetworkInterface
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${EvidenceBucket.Arn}/*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+
+  MonitorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Monitors a MediaConnect Router input and handles frozen-frame failover
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt MonitorFunctionRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      LoggingConfig:
+        LogGroup: !Ref MonitorFunctionLogGroup
+      Environment:
+        Variables:
+          ROUTER_INPUT_ARN: !Ref MonitoredRouterInput
+          S3_BUCKET: !Ref EvidenceBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          PRIMARY_SOURCE_INDEX: '0'
+      Code: lambda/
+
+  FrozenFrameRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers the monitor Lambda on Router input frozen-frame detections
+      EventPattern:
+        source:
+          - aws.mediaconnect
+        detail-type:
+          - MediaConnect Router Input Content Quality
+        resources:
+          - !Ref MonitoredRouterInput
+        detail:
+          current:
+            frozenFrames:
+              - DETECTED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MonitorFunction.Arn
+          Id: MediaConnectRouterMonitorTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FrozenFrameRule.Arn
+
+Outputs:
+  RouterInputArn:
+    Description: ARN of the MediaConnect Router input
+    Value: !Ref MonitoredRouterInput
+  RouterInputName:
+    Description: Name of the MediaConnect Router input
+    Value: !Sub '${AWS::StackName}-input'
+  RouterInputIngestIp:
+    Description: Public IP address to which both RTP sources send video
+    Value: !GetAtt MonitoredRouterInput.IpAddress
+  PrimarySourceIngestPort:
+    Description: RTP ingest port for the primary source
+    Value: 20000
+  SecondarySourceIngestPort:
+    Description: RTP ingest port for the secondary source
+    Value: 20001
+  EvidenceBucketName:
+    Description: S3 bucket storing captured thumbnails and source metadata
+    Value: !Ref EvidenceBucket
+  AccessLogBucketName:
+    Description: S3 bucket storing server access logs for the evidence bucket
+    Value: !Ref AccessLogBucket
+  NotificationTopicArn:
+    Description: SNS topic used for failover notifications
+    Value: !Ref NotificationTopic
+  LambdaFunctionName:
+    Description: Name of the monitoring Lambda function
+    Value: !Ref MonitorFunction
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule
+    Value: !Ref FrozenFrameRule
