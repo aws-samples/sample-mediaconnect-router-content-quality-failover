@@ -34,7 +34,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${SCRIPT_DIR}/template.yaml"
 PACKAGED="${SCRIPT_DIR}/packaged.yaml"
 
-# Use a named profile through the environment so every AWS CLI call inherits it.
 if [[ -n "${AWS_PROFILE_NAME}" ]]; then
   export AWS_PROFILE="${AWS_PROFILE_NAME}"
 fi

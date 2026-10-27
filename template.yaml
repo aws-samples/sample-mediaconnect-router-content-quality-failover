@@ -33,6 +33,15 @@ Resources:
   # S3 bucket that receives server access logs for the evidence bucket.
   AccessLogBucket:
     Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: This educational demo skips access logging on the log bucket to avoid recursive self-logging.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: This educational demo skips access logging on the log bucket to avoid recursive self-logging.
     Properties:
       BucketName: !Sub 'amzn-mediaconnect-demo-access-logs-${AWS::AccountId}-${AWS::Region}'
       BucketEncryption:
@@ -46,9 +55,6 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
-      LoggingConfiguration:
-        DestinationBucketName: !Sub 'amzn-mediaconnect-demo-access-logs-${AWS::AccountId}-${AWS::Region}'
-        LogFilePrefix: access-log-bucket-logs/
 
   AccessLogBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -65,9 +71,7 @@ Resources:
             Resource: !Sub '${AccessLogBucket.Arn}/*'
             Condition:
               ArnLike:
-                aws:SourceArn:
-                  - !GetAtt EvidenceBucket.Arn
-                  - !GetAtt AccessLogBucket.Arn
+                aws:SourceArn: !GetAtt EvidenceBucket.Arn
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
           - Sid: DenyInsecureTransport

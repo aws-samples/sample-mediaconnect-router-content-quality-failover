@@ -21,24 +21,29 @@ if [[ -n "${AWS_PROFILE_NAME}" ]]; then
   export AWS_PROFILE="${AWS_PROFILE_NAME}"
 fi
 
-# Empty a bucket completely, including all object versions and delete markers.
-# Both stack-created buckets have versioning enabled, so 'aws s3 rm --recursive'
-# alone leaves noncurrent versions and delete markers that block deletion.
 empty_bucket() {
   local bucket="$1"
-  echo "    Emptying s3://${bucket} (buckets must be empty before deletion)"
-  aws s3 rm "s3://${bucket}" --recursive >/dev/null 2>&1 || true
+  local payload errors
+  echo "    Emptying s3://${bucket}, including all object versions and delete markers"
   while :; do
-    local payload
     payload="$(aws s3api list-object-versions \
       --bucket "${bucket}" \
-      --max-items 1000 \
-      --query '{Objects: [Versions, DeleteMarkers][][].{Key: Key, VersionId: VersionId}}' \
-      --output json 2>/dev/null || echo '{"Objects": null}')"
+      --no-paginate \
+      --query '{Objects: [Versions, DeleteMarkers][][].{Key: Key, VersionId: VersionId}, Quiet: `true`}' \
+      --output json)"
     if echo "${payload}" | grep -Eq '"Objects": (null|\[\])'; then
       break
     fi
-    aws s3api delete-objects --bucket "${bucket}" --delete "${payload}" >/dev/null 2>&1 || break
+    errors="$(aws s3api delete-objects \
+      --bucket "${bucket}" \
+      --delete "${payload}" \
+      --query 'Errors' \
+      --output json)"
+    if [[ "${errors}" != "null" ]]; then
+      echo "    Failed to delete some objects from s3://${bucket}:" >&2
+      echo "${errors}" >&2
+      return 1
+    fi
   done
 }
 
@@ -50,7 +55,11 @@ for OUTPUT_KEY in EvidenceBucketName AccessLogBucketName; do
     --output text 2>/dev/null || true)"
 
   if [[ -n "${BUCKET}" && "${BUCKET}" != "None" ]]; then
-    empty_bucket "${BUCKET}"
+    if aws s3api head-bucket --bucket "${BUCKET}" >/dev/null 2>&1; then
+      empty_bucket "${BUCKET}"
+    else
+      echo "    s3://${BUCKET} not found or not accessible; skipping"
+    fi
   else
     echo "    No ${OUTPUT_KEY} output found; skipping"
   fi
